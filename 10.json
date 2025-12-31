@@ -1,0 +1,1127 @@
+#!/data/data/com.termux/files/usr/bin/python3
+# -*- coding: utf-8 -*-
+
+# ============================================================
+# IMPORTS — کامل، واقعی، بدون کم‌کاری
+# ============================================================
+
+import os
+import re
+import sys
+import json
+import yaml
+import time
+import math
+import base64
+import socket
+import random
+import string
+import threading
+import subprocess
+from typing import (
+    Any,
+    Dict,
+    List,
+    Tuple,
+    Optional,
+    Callable,
+    Iterable
+)
+from urllib.parse import (
+    urlparse,
+    parse_qs,
+    unquote,
+    quote
+)
+from collections import (
+    deque,
+    defaultdict,
+    OrderedDict
+)
+from concurrent.futures import (
+    ThreadPoolExecutor,
+    as_completed
+)
+
+# ============================================================
+# GLOBAL CONSTANTS — قابل کنترل، قابل توسعه
+# ============================================================
+
+APP_NAME            = "UltraProxyEngine"
+APP_VERSION         = "1.0.0"
+ENCODING            = "utf-8"
+
+TCP_PING_ATTEMPTS   = 7
+TCP_PING_TIMEOUT    = 2.0
+TCP_PING_MIN_MS     = 1
+TCP_PING_MAX_MS     = 30000
+
+MAX_WORKERS_DEFAULT = 48
+IO_SLEEP_GUARD      = 0.01
+
+# ============================================================
+# PATHS — پایدار، ایمن، قابل تغییر
+# ============================================================
+
+BASE_DIR = "/storage/emulated/0/Download/Akbar98"
+DOWNLOAD_DIR = "/storage/emulated/0/Download"
+
+INPUT_FILE_NAME = "input.txt"
+OUTPUT_FILE_EXT = ".yaml"
+
+def ensure_dir(path: str) -> None:
+    if not path:
+        raise ValueError("Empty path")
+    if not os.path.exists(path):
+        os.makedirs(path, exist_ok=True)
+
+ensure_dir(BASE_DIR)
+
+INPUT_PATH = os.path.join(BASE_DIR, INPUT_FILE_NAME)
+
+# ============================================================
+# LOW-LEVEL STRING & TYPE UTILITIES
+# ============================================================
+
+def safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def normalize_whitespace(text: str) -> str:
+    if not isinstance(text, str):
+        return ""
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def sanitize_name(text: str) -> str:
+    if not text:
+        return ""
+    text = normalize_whitespace(text)
+    return re.sub(r"[^A-Za-z0-9 _\-.]", "", text)
+
+
+def tail_token(text: str, length: int = 6) -> str:
+    if not text:
+        return ""
+    cleaned = re.sub(r"[^A-Za-z0-9]", "", text)
+    if len(cleaned) <= length:
+        return cleaned
+    return cleaned[-length:]
+
+
+def fix_base64_padding(data: str) -> str:
+    if not data:
+        return ""
+    data = data.strip().replace("\n", "").replace(" ", "")
+    missing = len(data) % 4
+    if missing:
+        data += "=" * (4 - missing)
+    return data
+
+
+# ============================================================
+# UNIQUE NAME REGISTRY — بدون برخورد، thread-safe
+# ============================================================
+
+class UniqueNameRegistry:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._used: set = set()
+
+    def generate(self, base: str) -> str:
+        base = sanitize_name(base) or "Proxy"
+        with self._lock:
+            if base not in self._used:
+                self._used.add(base)
+                return base
+            idx = 2
+            while True:
+                candidate = f"{base} {idx}"
+                if candidate not in self._used:
+                    self._used.add(candidate)
+                    return candidate
+                idx += 1
+
+
+NAME_REGISTRY = UniqueNameRegistry()
+
+# ============================================================
+# NETWORK LOW-LEVEL — TCP PING CORE
+# ============================================================
+
+def tcp_ping_once(
+    host: str,
+    port: int,
+    timeout: float
+) -> Optional[int]:
+    if not host or not port:
+        return None
+    sock = None
+    try:
+        start = time.monotonic()
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        sock.connect((host, int(port)))
+        end = time.monotonic()
+        return int((end - start) * 1000)
+    except Exception:
+        return None
+    finally:
+        try:
+            if sock:
+                sock.close()
+        except Exception:
+            pass
+
+
+def tcp_ping_median(
+    host: str,
+    port: int,
+    attempts: int = TCP_PING_ATTEMPTS,
+    timeout: float = TCP_PING_TIMEOUT
+) -> Optional[int]:
+    results: List[int] = []
+    for _ in range(attempts):
+        ping = tcp_ping_once(host, port, timeout)
+        if ping is not None:
+            results.append(ping)
+        time.sleep(IO_SLEEP_GUARD)
+
+    if not results:
+        return None
+
+    results.sort()
+    mid = len(results) // 2
+    if len(results) % 2 == 1:
+        return results[mid]
+    return (results[mid - 1] + results[mid]) // 2
+
+
+# ============================================================
+# PROXY OBJECT NORMALIZATION
+# ============================================================
+
+def normalize_proxy_object(proxy: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    این تابع:
+    - هیچ چیزی را حذف نمی‌کند
+    - فقط فیلدهای پایه را تضمین می‌کند
+    """
+    p = dict(proxy)
+
+    p.setdefault("name", NAME_REGISTRY.generate("Proxy"))
+    p.setdefault("udp", True)
+    p.setdefault("port", safe_int(p.get("port"), 0))
+
+    return p
+
+
+# ============================================================
+# THREAD-SAFE PRINT (برای runtime)
+# ============================================================
+
+_PRINT_LOCK = threading.Lock()
+
+def safe_print(*args, **kwargs) -> None:
+    with _PRINT_LOCK:
+        print(*args, **kwargs)
+        sys.stdout.flush()
+
+
+# ============================================================
+# FILE I/O — ایمن، اتمیک
+# ============================================================
+
+def atomic_write(path: str, data: str) -> None:
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w", encoding=ENCODING) as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, path)
+
+
+def read_text_file(path: str) -> str:
+    try:
+        with open(path, "r", encoding=ENCODING) as f:
+            return f.read()
+    except Exception:
+        return ""
+
+
+# ============================================================
+# END OF PART 1
+# ============================================================
+# ============================================================
+# PROXY PARSERS — VLESS / TROJAN / SS / HYSTERIA / HTTP / SOCKS / RAW IP / VMESS / SHADOWSOCKS-R / OTHER
+# ============================================================
+
+def parse_vless(line: str) -> Optional[Dict[str, Any]]:
+    if not line.lower().startswith("vless://"):
+        return None
+    try:
+        raw = line[8:]
+        name = ""
+        if "#" in raw:
+            raw, name = raw.split("#",1)
+            name = unquote(name)
+
+        main, qs_str = (raw.split("?",1)+[""])[:2]
+        q = dict(x.split("=",1) for x in qs_str.split("&") if "=" in x)
+
+        if "@" not in main:
+            return None
+
+        uuid, rest = main.split("@",1)
+        host, port = (rest.split(":",1)+["443"])[:2]
+
+        proxy = {
+            "name": NAME_REGISTRY.generate(name or f"vless-{host}-{tail_token(uuid)}"),
+            "type": "vless",
+            "server": host,
+            "port": safe_int(port,443),
+            "uuid": uuid,
+            "encryption": q.get("encryption","none"),
+            "network": q.get("type") or q.get("network") or "tcp",
+            "udp": True
+        }
+
+        if q.get("security") == "tls":
+            proxy["tls"] = True
+            proxy["servername"] = q.get("sni") or q.get("host") or host
+
+        if proxy["network"] == "ws":
+            proxy["ws-opts"] = {"path": q.get("path","/")}
+            if q.get("host"):
+                proxy["ws-opts"]["headers"] = {"Host": q.get("host")}
+
+        if proxy["network"] == "grpc" and q.get("serviceName"):
+            proxy["grpc-opts"] = {"grpc-service-name": q.get("serviceName")}
+
+        return proxy
+    except Exception:
+        return None
+
+
+def parse_trojan(line: str) -> Optional[Dict[str, Any]]:
+    if not line.lower().startswith("trojan://"):
+        return None
+    try:
+        u = urlparse(line)
+        if not u.hostname or not u.username:
+            return None
+
+        proxy = {
+            "name": NAME_REGISTRY.generate(u.fragment or f"trojan-{u.hostname}"),
+            "type": "trojan",
+            "server": u.hostname,
+            "port": u.port or 443,
+            "password": u.username,
+            "udp": True
+        }
+
+        q = parse_qs(u.query)
+        if "sni" in q: proxy["sni"] = q["sni"][0]
+        if q.get("type",[""])[0] == "ws":
+            proxy["network"] = "ws"
+            proxy["ws-opts"] = {"path": q.get("path",["/"])[0]}
+
+        return proxy
+    except Exception:
+        return None
+
+
+def parse_ss(line: str) -> Optional[Dict[str, Any]]:
+    if not line.lower().startswith("ss://"):
+        return None
+    try:
+        body = line[5:]
+        name = ""
+        if "#" in body:
+            body, name = body.split("#",1)
+            name = unquote(name)
+
+        if "@" not in body or ":" not in body:
+            return None
+
+        creds, addr = body.split("@",1)
+        method, password = creds.split(":",1)
+        host, port = addr.split(":",1)
+
+        return {
+            "name": NAME_REGISTRY.generate(name or f"ss-{host}"),
+            "type": "ss",
+            "server": host,
+            "port": safe_int(port),
+            "cipher": method,
+            "password": password,
+            "udp": True
+        }
+    except Exception:
+        return None
+
+
+def parse_hysteria1(line: str) -> Optional[Dict[str, Any]]:
+    if not line.lower().startswith("hy://"):
+        return None
+    try:
+        raw = line[5:]
+        auth, rest = raw.split("@",1)
+        host, port = rest.split(":",1)
+        return {
+            "name": NAME_REGISTRY.generate(f"hysteria-{host}"),
+            "type": "hysteria",
+            "server": host,
+            "port": safe_int(port),
+            "auth": auth,
+            "udp": True
+        }
+    except Exception:
+        return None
+
+
+def parse_hysteria2(line: str) -> Optional[Dict[str, Any]]:
+    if not (line.lower().startswith("hy2://") or line.lower().startswith("hysteria2://")):
+        return None
+    try:
+        raw = line.split("://",1)[1]
+        auth, rest = raw.split("@",1)
+        host, port = rest.split(":",1)
+        return {
+            "name": NAME_REGISTRY.generate(f"hysteria2-{host}"),
+            "type": "hysteria2",
+            "server": host,
+            "port": safe_int(port),
+            "password": auth,
+            "udp": True
+        }
+    except Exception:
+        return None
+
+
+def parse_http(line: str) -> Optional[Dict[str, Any]]:
+    if not line.lower().startswith("http://"):
+        return None
+    try:
+        u = urlparse(line)
+        if not u.hostname or not u.port:
+            return None
+        return {
+            "name": NAME_REGISTRY.generate(f"http-{u.hostname}"),
+            "type": "http",
+            "server": u.hostname,
+            "port": u.port,
+            "username": u.username or "",
+            "password": u.password or "",
+            "udp": False
+        }
+    except Exception:
+        return None
+
+
+def parse_socks(line: str) -> Optional[Dict[str, Any]]:
+    if not (line.lower().startswith("socks://") or line.lower().startswith("socks5://")):
+        return None
+    try:
+        u = urlparse(line)
+        if not u.hostname or not u.port:
+            return None
+        return {
+            "name": NAME_REGISTRY.generate(f"socks-{u.hostname}"),
+            "type": "socks5",
+            "server": u.hostname,
+            "port": u.port,
+            "username": u.username or "",
+            "password": u.password or "",
+            "udp": True
+        }
+    except Exception:
+        return None
+
+
+def parse_ipport(line: str) -> Optional[Dict[str, Any]]:
+    if ":" in line and "://" not in line:
+        try:
+            host, port = line.split(":",1)
+            return {
+                "name": NAME_REGISTRY.generate(f"raw-{host}"),
+                "type": "http",
+                "server": host,
+                "port": safe_int(port),
+                "udp": True
+            }
+        except Exception:
+            return None
+    return None
+
+
+# ============================================================
+# MASTER PARSER
+# ============================================================
+
+PROXY_PARSERS: Tuple[Callable[[str], Optional[Dict[str, Any]]], ...] = (
+    parse_vless,
+    parse_trojan,
+    parse_ss,
+    parse_hysteria1,
+    parse_hysteria2,
+    parse_http,
+    parse_socks
+)
+
+def parse_line_any(line: str) -> List[Dict[str, Any]]:
+    for parser in PROXY_PARSERS:
+        proxy = parser(line)
+        if proxy:
+            return [normalize_proxy_object(proxy)]
+    proxy = parse_ipport(line)
+    return [normalize_proxy_object(proxy)] if proxy else []
+
+
+def parse_any(text: str) -> List[Dict[str, Any]]:
+    lines = text.splitlines()
+    out: List[Dict[str, Any]] = []
+    for ln in lines:
+        ln = ln.strip()
+        if not ln:
+            continue
+        out.extend(parse_line_any(ln))
+    return out
+    
+    # ============================================================
+# GROUP / PING / SWITCH CONFIGURATION CORE
+# ============================================================
+
+USER_CONFIG = {
+    "ping": {
+        "attempts": 7,
+        "tcp_timeout": 0.4,
+        "min_ms": 1,
+        "green_max": 800,
+        "yellow_max": 1500
+    },
+    "switch": {
+        "history_size": 30,
+        "check_interval": 5,
+        "re_ping_attempts": 3
+    },
+    "groups": {
+        "FAST⚡": {
+            "type": "url-test",
+            "max_active": 3,
+            "interval": 25,
+            "timeout": 3,
+            "tolerance": 50,
+            "allowed_ping": (1, 800)
+        },
+        "STABLE🟢": {
+            "type": "fallback",
+            "max_active": 5,
+            "interval": 60,
+            "timeout": 5,
+            "tolerance": 80,
+            "allowed_ping": (1, 1200)
+        },
+        "SAFE🟡": {
+            "type": "fallback",
+            "max_active": 7,
+            "interval": 180,
+            "timeout": 8,
+            "tolerance": 120,
+            "allowed_ping": (800, 1500)
+        }
+    }
+}
+
+# ============================================================
+# PING CLASSIFICATION
+# ============================================================
+
+def classify_ping(ms: Optional[int]) -> str:
+    if ms is None:
+        return "red"
+    if USER_CONFIG["ping"]["min_ms"] <= ms <= USER_CONFIG["ping"]["green_max"]:
+        return "green"
+    if ms <= USER_CONFIG["ping"]["yellow_max"]:
+        return "yellow"
+    return "red"
+
+# ============================================================
+# TCP PING ENGINE (ROBUST)
+# ============================================================
+
+def tcp_ping_once(host: str, port: int, timeout: float) -> Optional[int]:
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        start = time.monotonic()
+        sock.connect((host, port))
+        sock.close()
+        return int((time.monotonic() - start) * 1000)
+    except Exception:
+        return None
+
+
+def tcp_ping_median(host: str, port: int, attempts: int, timeout: float) -> Optional[int]:
+    samples: List[int] = []
+    for _ in range(attempts):
+        r = tcp_ping_once(host, port, timeout)
+        if r is not None:
+            samples.append(r)
+    if not samples:
+        return None
+    samples.sort()
+    mid = len(samples) // 2
+    return samples[mid] if len(samples) % 2 else (samples[mid-1] + samples[mid]) // 2
+
+
+def attach_ping(proxy: Dict[str, Any]) -> Dict[str, Any]:
+    proxy["ping"] = tcp_ping_median(
+        proxy["server"],
+        proxy["port"],
+        USER_CONFIG["ping"]["attempts"],
+        USER_CONFIG["ping"]["tcp_timeout"]
+    )
+    proxy["status"] = "ok" if proxy["ping"] is not None else "dead"
+    proxy["quality"] = classify_ping(proxy["ping"])
+    return proxy
+
+# ============================================================
+# MASS PING (THREAD POOL)
+# ============================================================
+
+def ping_all(proxies: List[Dict[str, Any]], workers: int = 40) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=min(workers, len(proxies))) as ex:
+        futures = [ex.submit(attach_ping, p) for p in proxies]
+        for fut in as_completed(futures):
+            try:
+                out.append(fut.result())
+            except Exception:
+                pass
+    return out
+
+# ============================================================
+# GROUP BUILDER
+# ============================================================
+
+def build_proxy_groups(alive: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    groups: List[Dict[str, Any]] = []
+
+    # sort by ping ascending
+    alive_sorted = sorted(alive, key=lambda x: x.get("ping", 999999))
+
+    for gname, cfg in USER_CONFIG["groups"].items():
+        lo, hi = cfg["allowed_ping"]
+
+        eligible = [
+            p for p in alive_sorted
+            if p.get("ping") is not None and lo <= p["ping"] <= hi
+        ]
+
+        selected = eligible[:cfg["max_active"]]
+        if not selected:
+            continue
+
+        groups.append({
+            "name": gname,
+            "type": cfg["type"],
+            "url": "https://www.gstatic.com/generate_204",
+            "interval": cfg["interval"],
+            "timeout": cfg["timeout"],
+            "tolerance": cfg["tolerance"],
+            "proxies": [p["name"] for p in selected]
+        })
+
+    return groups
+
+# ============================================================
+# SMART SWITCH ENGINE (STATISTICAL)
+# ============================================================
+
+def smart_switch_loop(groups: List[Dict[str, Any]],
+                      proxy_map: Dict[str, Dict[str, Any]],
+                      out_path: str):
+
+    histories: Dict[str, deque] = {
+        pname: deque(maxlen=USER_CONFIG["switch"]["history_size"])
+        for g in groups for pname in g["proxies"]
+    }
+
+    def loop():
+        while True:
+            for group in groups:
+                best_name = group["proxies"][0]
+                best_avg = float("inf")
+
+                for pname in list(group["proxies"]):
+                    proxy = proxy_map.get(pname)
+                    if not proxy:
+                        continue
+
+                    r = tcp_ping_once(
+                        proxy["server"],
+                        proxy["port"],
+                        USER_CONFIG["ping"]["tcp_timeout"]
+                    )
+                    if r is not None:
+                        histories[pname].append(r)
+
+                    avg = (
+                        sum(histories[pname]) / len(histories[pname])
+                        if histories[pname] else float("inf")
+                    )
+
+                    if avg < best_avg:
+                        best_avg = avg
+                        best_name = pname
+
+                if best_name != group["proxies"][0]:
+                    group["proxies"].remove(best_name)
+                    group["proxies"].insert(0, best_name)
+                    print(f"[⚡ SWITCH] {group['name']} → {best_name}")
+
+            with open(out_path, "w", encoding="utf-8") as f:
+                yaml.safe_dump(CONFIG_YAML, f, allow_unicode=True, sort_keys=False)
+
+            time.sleep(USER_CONFIG["switch"]["check_interval"])
+
+    threading.Thread(target=loop, daemon=True).start()
+
+# ============================================================
+# YAML FINAL ASSEMBLER
+# ============================================================
+
+def build_final_yaml(proxies: List[Dict[str, Any]],
+                     groups: List[Dict[str, Any]]) -> Dict[str, Any]:
+
+    select_group = {
+        "name": "SELECT",
+        "type": "select",
+        "proxies": [g["name"] for g in groups] + ["DIRECT"]
+    }
+
+    return {
+        "proxies": proxies,
+        "proxy-groups": [select_group] + groups,
+        "rules": [
+            "MATCH,SELECT"
+        ]
+    }
+    
+    # ============================================================
+# INPUT FILES / USER INTERACTION
+# ============================================================
+
+BASE_DIR = "/storage/emulated/0/Download/Akbar98"
+os.makedirs(BASE_DIR, exist_ok=True)
+INPUT_PATH = os.path.join(BASE_DIR, "input.txt")
+
+with open(INPUT_PATH, "w", encoding="utf-8") as f:
+    f.write("")
+
+subprocess.call(["nano", INPUT_PATH])
+
+out_folder = input("Enter output folder name in Download: ").strip()
+if not out_folder:
+    print("Folder name required."); exit(1)
+OUT_DIR = os.path.join("/storage/emulated/0/Download", out_folder)
+os.makedirs(OUT_DIR, exist_ok=True)
+
+out_name = input("Enter output file name (without extension): ").strip()
+if not out_name:
+    print("File name required."); exit(1)
+OUT_PATH = os.path.join(OUT_DIR, f"{out_name}.yaml")
+
+# ============================================================
+# VALIDATION
+# ============================================================
+
+def validate_proxy(p: Dict[str, Any]) -> bool:
+    if not isinstance(p, dict):
+        return False
+    t = p.get("type")
+    if not t or not p.get("server"):
+        return False
+    port = safe_int(p.get("port"))
+    if not (1 <= port <= 65535):
+        return False
+    if t in ("vless", "vmess") and not p.get("uuid"):
+        return False
+    if t == "trojan" and not p.get("password"):
+        return False
+    if t == "ss" and not (p.get("cipher") and p.get("password")):
+        return False
+    return True
+
+def dedupe_proxies(proxies: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    seen = set()
+    out = []
+    for p in proxies:
+        key = (
+            p.get("type"),
+            p.get("server"),
+            int(safe_int(p.get("port"))),
+            p.get("uuid") or p.get("password") or p.get("auth") or ""
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(p)
+    return out
+
+# ============================================================
+# PARSER → VALIDATE → PING → GROUPS → YAML FLOW
+# ============================================================
+
+print("[*] Reading input...")
+try:
+    with open(INPUT_PATH, "r", encoding="utf-8") as f:
+        raw_input = f.read()
+except Exception:
+    raw_input = ""
+
+print("[*] Parsing proxies...")
+parsed_proxies = parse_any(raw_input)
+
+if not parsed_proxies:
+    print("[!] No proxies parsed.")
+    proxies = []
+else:
+    print(f"[+] Parsed {len(parsed_proxies)} raw proxies")
+    proxies = dedupe_proxies(parsed_proxies)
+    proxies = [p for p in proxies if validate_proxy(p)]
+    print(f"[+] {len(proxies)} proxies after validation")
+
+print("[*] Pinging proxies...")
+proxies = ping_all(proxies)
+alive = [p for p in proxies if p.get("status") == "ok"]
+print(f"[+] {len(alive)} alive proxies")
+
+print("[*] Building groups...")
+proxy_groups = build_proxy_groups(alive)
+
+# build a map for smart switch
+proxy_map = {p["name"]: p for p in alive}
+
+print("[*] Initial YAML assembling...")
+CONFIG_YAML = build_final_yaml(alive, proxy_groups)
+
+with open(OUT_PATH, "w", encoding="utf-8") as f:
+    yaml.safe_dump(CONFIG_YAML, f, allow_unicode=True, sort_keys=False)
+
+print(f"[✅] Saved {len(alive)} proxies → {OUT_PATH}")
+
+# ============================================================
+# START SMART SWITCH THREAD
+# ============================================================
+
+if proxy_groups:
+    print("[*] Starting smart switch loop...")
+    smart_switch_loop(proxy_groups, proxy_map, OUT_PATH)
+else:
+    print("[!] No groups to manage for smart switch.")
+    # ============================================================
+# USER CONFIGURATION INTERFACE
+# ============================================================
+
+USER_CONFIG = {
+    "ping": {
+        "attempts": 7,
+        "tcp_timeout": 0.4,
+        "green_range": (1, 800),
+        "yellow_range": (801, 1500)
+    },
+    "switch": {
+        "check_interval": 5,
+        "history_size": 30
+    },
+    "groups": {
+        "FAST⚡": {"type": "url-test", "max_active": 3, "interval": 25, "tolerance": 50, "timeout": 3, "allowed_ping": (1,800)},
+        "STABLE🟢": {"type": "fallback", "max_active": 5, "interval": 60, "tolerance": 80, "timeout": 5, "allowed_ping": (1,1200)},
+        "SAFE🟡": {"type": "fallback", "max_active": 7, "interval": 180, "tolerance": 120, "timeout": 8, "allowed_ping": (800,1500)}
+    }
+}
+
+def input_int(prompt:str, default:int, min_val:int=None, max_val:int=None) -> int:
+    while True:
+        try:
+            val = input(f"{prompt} [{default}]: ").strip()
+            if not val:
+                return default
+            val_int = int(val)
+            if min_val is not None and val_int < min_val:
+                print(f"Value must be >= {min_val}")
+                continue
+            if max_val is not None and val_int > max_val:
+                print(f"Value must be <= {max_val}")
+                continue
+            return val_int
+        except:
+            print("Enter a valid integer")
+
+def input_str(prompt:str, default:str) -> str:
+    val = input(f"{prompt} [{default}]: ").strip()
+    return val if val else default
+
+def configure_user_settings():
+    print("\n=== Configure Proxy System ===\n")
+    
+    # ---------- ping ----------
+    USER_CONFIG["ping"]["attempts"] = input_int("Ping attempts", USER_CONFIG["ping"]["attempts"], 1, 100)
+    USER_CONFIG["ping"]["tcp_timeout"] = float(input_int(
+        "Ping timeout (ms)", int(USER_CONFIG["ping"]["tcp_timeout"]*1000), 10, 5000))/1000
+    USER_CONFIG["ping"]["green_range"] = (
+        input_int("Green ping min", USER_CONFIG["ping"]["green_range"][0], 1, 5000),
+        input_int("Green ping max", USER_CONFIG["ping"]["green_range"][1], 1, 5000)
+    )
+    USER_CONFIG["ping"]["yellow_range"] = (
+        input_int("Yellow ping min", USER_CONFIG["ping"]["yellow_range"][0], 1, 5000),
+        input_int("Yellow ping max", USER_CONFIG["ping"]["yellow_range"][1], 1, 5000)
+    )
+
+    # ---------- smart switch ----------
+    USER_CONFIG["switch"]["check_interval"] = input_int("Switch check interval (sec)", USER_CONFIG["switch"]["check_interval"], 1, 3600)
+    USER_CONFIG["switch"]["history_size"] = input_int("Switch history size", USER_CONFIG["switch"]["history_size"], 1, 100)
+
+    # ---------- groups ----------
+    print("\n--- Configure Groups ---")
+    for gname, cfg in list(USER_CONFIG["groups"].items()):
+        print(f"\nGroup: {gname}")
+        new_name = input_str("Display name", gname)
+        cfg["max_active"] = input_int("Max active proxies", cfg["max_active"], 1, 50)
+        cfg["interval"] = input_int("Interval (sec)", cfg["interval"], 1, 3600)
+        cfg["timeout"] = input_int("Timeout (sec)", cfg["timeout"], 1, 60)
+        cfg["tolerance"] = input_int("Tolerance", cfg["tolerance"], 1, 500)
+        lo = input_int("Allowed ping min", cfg["allowed_ping"][0], 1, 5000)
+        hi = input_int("Allowed ping max", cfg["allowed_ping"][1], lo, 5000)
+        cfg["allowed_ping"] = (lo, hi)
+        USER_CONFIG["groups"][new_name] = USER_CONFIG["groups"].pop(gname)
+    
+    print("\n[✅] Configuration updated!\n")
+
+# ============ RUN INTERACTIVE CONFIG ============
+configure_user_settings()
+# ============================================================
+# SMART SWITCH ENGINE
+# ============================================================
+
+from collections import deque
+import threading
+import yaml
+import time
+
+def build_groups_from_config(alive_proxies):
+    """
+    Build proxy groups dynamically based on USER_CONFIG settings.
+    """
+    groups = []
+    sorted_alive = sorted(alive_proxies, key=lambda x: x.get("ping", 99999))
+    
+    for gname, gconf in USER_CONFIG["groups"].items():
+        lo, hi = gconf["allowed_ping"]
+        filtered = [p for p in sorted_alive if lo <= p["ping"] <= hi]
+        active = filtered[:gconf["max_active"]]
+        if not active:
+            continue
+        groups.append({
+            "name": gname,
+            "type": gconf["type"],
+            "url": "https://www.gstatic.com/generate_204",
+            "interval": gconf["interval"],
+            "timeout": gconf["timeout"],
+            "tolerance": gconf["tolerance"],
+            "proxies": [p["name"] for p in active]
+        })
+    return groups
+
+def smart_switch_loop(groups, proxy_map, out_path):
+    """
+    Run a daemon thread that continuously evaluates proxies in each group
+    and moves the best performing proxy to the top.
+    """
+    histories = {p["name"]: deque(maxlen=USER_CONFIG["switch"]["history_size"]) 
+                 for g in groups for p in g["proxies"]}
+
+    def loop():
+        while True:
+            for g in groups:
+                best = g["proxies"][0]
+                best_avg = 99999
+
+                for pname in g["proxies"]:
+                    p = proxy_map[pname]
+                    r = tcp_ping_median(p["server"], p["port"], USER_CONFIG["ping"]["attempts"])
+                    if r is not None:
+                        histories[pname].append(r)
+
+                    avg = sum(histories[pname])/len(histories[pname]) if histories[pname] else 99999
+                    if avg < best_avg:
+                        best_avg = avg
+                        best = pname
+
+                # Swap if new best found
+                if best != g["proxies"][0]:
+                    g["proxies"].remove(best)
+                    g["proxies"].insert(0, best)
+                    print(f"[⚡] SWITCH {g['name']} → {best}")
+
+            # Update YAML
+            with open(out_path, "w", encoding="utf-8") as f:
+                yaml.safe_dump(CONFIG_YAML, f, allow_unicode=True, sort_keys=False)
+
+            time.sleep(USER_CONFIG["switch"]["check_interval"])
+
+    threading.Thread(target=loop, daemon=True).start()
+    
+    # ============================================================
+# FINAL YAML BUILDER
+# ============================================================
+
+import yaml
+from copy import deepcopy
+
+def build_final_yaml(alive_proxies, out_path):
+    """
+    Build the complete YAML configuration with proxies and groups
+    """
+    proxy_names = [p["name"] for p in alive_proxies]
+
+    # --- Define core groups ---
+    core_groups = [
+        {"name": "Select", "type": "select", "proxies": ["Auto", "Stable", "Fallback", "DIRECT"] + proxy_names},
+        {"name": "Auto", "type": "url-test", "url": "https://www.gstatic.com/generate_204",
+         "interval": USER_CONFIG["groups"].get("Auto", {}).get("interval", 25),
+         "tolerance": USER_CONFIG["groups"].get("Auto", {}).get("tolerance", 50),
+         "proxies": proxy_names},
+        {"name": "Stable", "type": "fallback", "url": "https://www.gstatic.com/generate_204",
+         "interval": USER_CONFIG["groups"].get("Stable", {}).get("interval", 3),
+         "proxies": proxy_names},
+        {"name": "Fallback", "type": "fallback", "url": "https://www.gstatic.com/generate_204",
+         "interval": USER_CONFIG["groups"].get("Fallback", {}).get("interval", 20),
+         "timeout": USER_CONFIG["groups"].get("Fallback", {}).get("timeout", 3),
+         "tolerance": USER_CONFIG["groups"].get("Fallback", {}).get("tolerance", 50),
+         "proxies": proxy_names}
+    ]
+
+    # --- Add dynamic user-defined groups ---
+    dynamic_groups = build_groups_from_config(alive_proxies)
+    
+    all_groups = core_groups + dynamic_groups
+
+    # --- Build master config ---
+    config_yaml = {
+        "proxies": deepcopy(alive_proxies),
+        "proxy-groups": all_groups,
+        "rules": ["MATCH,Select"]
+    }
+
+    # --- Save YAML ---
+    with open(out_path, "w", encoding="utf-8") as f:
+        yaml.safe_dump(config_yaml, f, allow_unicode=True, sort_keys=False)
+
+    print(f"[✅] Final YAML built: {len(alive_proxies)} proxies → {out_path}")
+    return config_yaml
+    
+    # ============================================================
+# MAIN LOOP: PARSE, PING, BUILD YAML, SMART SWITCH
+# ============================================================
+
+def main():
+    # 1. Load input proxies
+    print("[*] Loading input proxies...")
+    try:
+        with open(INPUT_PATH, "r", encoding="utf-8") as f:
+            raw_text = f.read()
+    except Exception:
+        raw_text = ""
+    
+    # 2. Parse proxies
+    print("[*] Parsing proxies...")
+    parsed = parse_any(raw_text)
+    if not parsed:
+        print("[!] No proxies parsed. Exiting.")
+        return
+
+    # 3. Deduplicate
+    proxies = dedupe_proxies(parsed)
+    print(f"[+] {len(proxies)} unique proxies after deduplication")
+
+    # 4. Validate
+    proxies = [p for p in proxies if validate_proxy(p)]
+    print(f"[+] {len(proxies)} proxies passed validation")
+
+    # 5. Attach ping
+    print("[*] Attaching TCP ping...")
+    with ThreadPoolExecutor(max_workers=min(40, len(proxies))) as ex:
+        futures = [ex.submit(check_and_attach_ping, p) for p in proxies]
+        final_proxies = [f.result() for f in as_completed(futures)]
+    
+    alive_proxies = [p for p in final_proxies if p.get("status")=="ok"]
+    print(f"[+] {len(alive_proxies)} alive proxies")
+
+    # 6. Build final YAML
+    config_yaml = build_final_yaml(alive_proxies, OUT_PATH)
+
+    # 7. Smart switch setup
+    print("[*] Starting smart switch loop...")
+    def smart_switch_loop():
+        if not alive_proxies:
+            print("[!] No alive proxies for smart switch")
+            return
+
+        sorted_proxies = sorted(alive_proxies, key=lambda x: x["ping"])
+        ping_history = {p["name"]: deque(maxlen=USER_CONFIG["switch"]["history_size"])
+                        for p in sorted_proxies}
+
+        active = sorted_proxies[0]
+
+        while True:
+            best = active
+            for p in sorted_proxies:
+                ping = tcp_ping_ms(p["server"], p["port"], timeout=USER_CONFIG["ping"]["tcp_timeout"])
+                if ping is not None:
+                    ping_history[p["name"]].append(ping)
+                avg = (sum(ping_history[p["name"]])/len(ping_history[p["name"]])
+                       if ping_history[p["name"]] else 99999)
+                best_avg = (sum(ping_history[best["name"]])/len(ping_history[best["name"]])
+                            if ping_history[best["name"]] else 99999)
+                if avg < best_avg:
+                    best = p
+
+            if best["name"] != active["name"]:
+                active = best
+                print(f"[⚡] Smart switch → {active['name']}")
+
+            # Reorder fallback/stable groups
+            order = [p["name"] for p in sorted_proxies if p["name"] != active["name"]]
+            order.insert(0, active["name"])
+
+            for g in config_yaml["proxy-groups"]:
+                if g["name"] in ("Stable", "Fallback"):
+                    g["proxies"] = order
+
+            # Save updated YAML
+            with open(OUT_PATH, "w", encoding="utf-8") as f:
+                yaml.safe_dump(config_yaml, f, allow_unicode=True, sort_keys=False)
+
+            time.sleep(USER_CONFIG["switch"]["check_interval"])
+
+    # Start smart switch in background
+    threading.Thread(target=smart_switch_loop, daemon=True).start()
+    print("[✅] Smart switch running in background")
+
+# ================= RUN MAIN =================
+if __name__ == "__main__":
+    main()
+
